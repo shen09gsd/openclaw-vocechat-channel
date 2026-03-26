@@ -3023,13 +3023,14 @@ function createWebhookHandler(params: {
     });
 
     if (!jsonResult.ok) {
+      const err = (jsonResult as { ok: false; error: string; code: string }).error;
       logger?.warn?.(
-        `[vocechat] webhook reject: invalid_json account=${accountId} detail=${String(jsonResult.error)}`,
+        `[vocechat] webhook reject: invalid_json account=${accountId} detail=${String(err)}`,
       );
       writeJson(res, 400, {
         ok: false,
         error: "invalid_json",
-        detail: jsonResult.error,
+        detail: err,
       });
       return;
     }
@@ -3306,6 +3307,7 @@ const voceChatChannel: ChannelPlugin<ResolvedAccount> = {
         path: account.webhookPath,
         fallbackPath: DEFAULT_WEBHOOK_PATH,
         handler: handler as any,
+        auth: "gateway",
         pluginId: CHANNEL_ID,
         accountId: account.accountId,
         log: (message) => ctx.log?.info(message),
