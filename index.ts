@@ -5,18 +5,12 @@ import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 
-import {
-  createNormalizedOutboundDeliverer,
-  createReplyPrefixOptions,
-  DEFAULT_WEBHOOK_BODY_TIMEOUT_MS,
-  DEFAULT_WEBHOOK_MAX_BODY_BYTES,
-  formatTextWithAttachmentLinks,
-  loadOutboundMediaFromUrl,
-  readJsonBodyWithLimit,
-  registerPluginHttpRoute,
-  resolveOutboundMediaUrls,
-  writeJsonFileAtomically,
-} from "openclaw/plugin-sdk";
+import { registerPluginHttpRoute, loadOutboundMediaFromUrl } from "/usr/lib/node_modules/openclaw/dist/plugin-sdk/mattermost.js";
+import { DEFAULT_WEBHOOK_BODY_TIMEOUT_MS, DEFAULT_WEBHOOK_MAX_BODY_BYTES } from "/usr/lib/node_modules/openclaw/dist/plugin-sdk/infra-runtime.js";
+import { createReplyPrefixOptions } from "/usr/lib/node_modules/openclaw/dist/plugin-sdk/channel-runtime.js";
+import { createNormalizedOutboundDeliverer, formatTextWithAttachmentLinks, resolveOutboundMediaUrls } from "/usr/lib/node_modules/openclaw/dist/plugin-sdk/irc.js";
+import { readJsonBodyWithLimit } from "/usr/lib/node_modules/openclaw/dist/plugin-sdk/feishu.js";
+import { writeJsonFileAtomically } from "/usr/lib/node_modules/openclaw/dist/plugin-sdk/json-store.js";
 import type {
   ChannelOutboundContext,
   ChannelPlugin,
@@ -66,6 +60,38 @@ const ALLOWED_INBOUND_IMAGE_MIME_TYPES = new Set([
 ]);
 const IMAGE_TYPE_KEYWORDS = new Set(["image", "img", "photo", "picture", "pic", "snapshot"]);
 
+// Audio support constants
+const INBOUND_AUDIO_EXTENSIONS = new Set([
+  ".mp3",
+  ".wav",
+  ".ogg",
+  ".oga",
+  ".m4a",
+  ".aac",
+  ".flac",
+  ".opus",
+  ".webm",
+  ".amr",
+]);
+
+const ALLOWED_INBOUND_AUDIO_MIME_TYPES = new Set([
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/ogg",
+  "audio/oga",
+  "audio/mp4",
+  "audio/m4a",
+  "audio/aac",
+  "audio/flac",
+  "audio/opus",
+  "audio/webm",
+  "audio/amr",
+]);
+
+const AUDIO_TYPE_KEYWORDS = new Set(["audio", "voice", "voice_message", "voice_message_v2", "audio_message"]);
+
 type InboundParseMode = "legacy" | "balanced" | "strict";
 
 type VoceChatAccountConfig = {
@@ -93,8 +119,13 @@ type VoceChatAccountConfig = {
   groupAllowFrom?: unknown;
 };
 
+type VoceChatGroupConfig = {
+  requireMention?: boolean;
+};
+
 type VoceChatChannelConfig = VoceChatAccountConfig & {
   accounts?: Record<string, VoceChatAccountConfig>;
+  groups?: Record<string, VoceChatGroupConfig>;
 };
 
 type VoceChatQuickTargets = {
@@ -107,6 +138,65 @@ type VoceChatManagementConfig = {
   panelStateFile: string;
   quickTargets: VoceChatQuickTargets;
 };
+
+function resolveVoceChatGroupRequireMention(cfg: OpenClawConfig, accountId: string, groupId: string): boolean {
+  const section = getChannelConfig(cfg);
+  // Check group-specific config first, then wildcard "*", then top-level requireMention on account
+  const groups = asRecord(section.groups);
+  const specificGroup = asRecord(groups[groupId]);
+  const wildcardGroup = asRecord(groups["*"]);
+  const accountRecord = asRecord(section.accounts?.[accountId]) as Record<string, unknown>;
+  const channelRecord = section as Record<string, unknown>;
+
+  if (specificGroup.requireMention === true) return true;
+  if (specificGroup.requireMention === false) return false;
+  if (wildcardGroup.requireMention === true) return true;
+  if (wildcardGroup.requireMention === false) return false;
+  if (accountRecord.requireMention === true) return true;
+  if (accountRecord.requireMention === false) return false;
+  if (channelRecord.requireMention === true) return true;
+  return false;
+}
+
+function getMentionPatternsFromConfig(cfg: OpenClawConfig): string[] {
+  // Try agents config first (main agent's groupChat.mentionPatterns)
+  const agentsRecord = asRecord(cfg.agents);
+  const agentsList = Array.isArray(agentsRecord.list) ? agentsRecord.list : [];
+  const firstAgent = asRecord(agentsList[0] ?? {});
+  const groupChat = asRecord(firstAgent.groupChat);
+  const patterns = Array.isArray(groupChat.mentionPatterns) ? groupChat.mentionPatterns : [];
+  if (patterns.length > 0) {
+    return patterns.map((p) => normalizeString(p)).filter(Boolean);
+  }
+
+  // Fallback: try vocechat channel config's groupChat.mentionPatterns
+  const vocechatChannel = asRecord(cfg.channels?.vocechat);
+  const vocechatGroupChat = asRecord(vocechatChannel?.groupChat);
+  const channelPatterns = Array.isArray(vocechatGroupChat?.mentionPatterns) ? vocechatGroupChat.mentionPatterns : [];
+  return channelPatterns.map((p) => normalizeString(p)).filter(Boolean);
+}
+
+function matchesMentionPattern(text: string, patterns: string[]): boolean {
+  if (patterns.length === 0) return true;
+  for (const pattern of patterns) {
+    // Handle @username style patterns
+    if (pattern.startsWith("@")) {
+      const rest = pattern.slice(1);
+      // Check for @username anywhere (VoceChat may include @ in the message text)
+      const escaped = rest.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (text.includes(pattern) || new RegExp(`@${escaped}`).test(text)) {
+        return true;
+      }
+    } else {
+      // Plain name pattern - check if it appears as a distinct token/segment
+      const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (text.includes(pattern) || new RegExp(`[@\\s]${escaped}[@\\s.,!?。？！]|$`).test(text)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 type ResolvedAccount = {
   accountId: string;
@@ -146,7 +236,7 @@ type VoceChatHttpResponse = {
 };
 
 type InboundAttachment = {
-  kind: "image";
+  kind: "image" | "audio";
   messageId: string;
   source: string;
   attachmentId?: string;
@@ -156,6 +246,8 @@ type InboundAttachment = {
   sizeBytes?: number;
   localFile?: string;
   downloadError?: string;
+  transcription?: string;
+  transcriptionError?: string;
 };
 
 type InboundEvent = {
@@ -177,6 +269,8 @@ let runtimeRef: PluginRuntime | null = null;
 const activeRouteUnregisters = new Map<string, () => void>();
 const recentOutboundMessageIds = new Map<string, number>();
 const recentInboundMessageIds = new Map<string, number>();
+// Content-based deduplication for voice messages (VoceChat sends same voice with different messageIds)
+const recentVoiceSignatures = new Map<string, number>();
 
 function setVoceChatRuntime(runtime: PluginRuntime): void {
   runtimeRef = runtime;
@@ -432,6 +526,86 @@ function isImageExtension(ext: string): boolean {
   return INBOUND_IMAGE_EXTENSIONS.has(ext.toLowerCase());
 }
 
+function isAudioExtension(ext: string): boolean {
+  return INBOUND_AUDIO_EXTENSIONS.has(ext.toLowerCase());
+}
+
+function isAllowedInboundAudioMimeType(value: unknown): boolean {
+  const normalized = normalizeMimeType(value);
+  if (!normalized) return false;
+  return ALLOWED_INBOUND_AUDIO_MIME_TYPES.has(normalized);
+}
+
+function isAudioTypeKeyword(value: unknown): boolean {
+  const normalized = normalizeInboundType(value);
+  if (!normalized) return false;
+  if (AUDIO_TYPE_KEYWORDS.has(normalized)) return true;
+  return normalized.startsWith("audio") || normalized.startsWith("voice");
+}
+
+function inferAudioMimeTypeFromExtension(ext: string): string | undefined {
+  switch (ext.toLowerCase()) {
+    case ".mp3":
+      return "audio/mpeg";
+    case ".wav":
+      return "audio/wav";
+    case ".ogg":
+    case ".oga":
+      return "audio/ogg";
+    case ".m4a":
+      return "audio/mp4";
+    case ".aac":
+      return "audio/aac";
+    case ".flac":
+      return "audio/flac";
+    case ".opus":
+      return "audio/opus";
+    case ".webm":
+      return "audio/webm";
+    case ".amr":
+      return "audio/amr";
+    default:
+      return undefined;
+  }
+}
+
+function inferAudioExtensionFromMimeType(mimeType: string): string {
+  switch (normalizeMimeType(mimeType)) {
+    case "audio/mpeg":
+    case "audio/mp3":
+      return ".mp3";
+    case "audio/wav":
+    case "audio/x-wav":
+      return ".wav";
+    case "audio/ogg":
+    case "audio/oga":
+      return ".ogg";
+    case "audio/mp4":
+    case "audio/m4a":
+      return ".m4a";
+    case "audio/aac":
+      return ".aac";
+    case "audio/flac":
+      return ".flac";
+    case "audio/opus":
+      return ".opus";
+    case "audio/webm":
+      return ".webm";
+    case "audio/amr":
+      return ".amr";
+    default:
+      return "";
+  }
+}
+
+function isLikelyAudioReference(value: unknown): boolean {
+  const normalized = normalizeString(value);
+  if (!normalized) return false;
+  const ext = extractExtensionFromPathLike(normalized);
+  if (isAudioExtension(ext)) return true;
+  return /\/audio(s)?\//i.test(normalized) || /\/voice(s)?\//i.test(normalized);
+}
+
 function extractExtensionFromPathLike(value: string): string {
   const normalized = normalizeString(value);
   if (!normalized) return "";
@@ -585,6 +759,19 @@ function parseInboundAttachmentCandidate(params: {
   const { value, source, messageId, account } = params;
 
   if (typeof value === "string") {
+    // Check for audio first
+    if (isLikelyAudioReference(value)) {
+      const resolvedUrl = resolveInboundMediaUrl(account, value);
+      if (resolvedUrl) {
+        return [{
+          kind: "audio" as const,
+          messageId,
+          source,
+          url: resolvedUrl,
+        }];
+      }
+    }
+    // Then check for image
     const refs = extractImageReferencesFromText(value);
     const candidates = refs.length > 0 ? refs : [value];
     return candidates
@@ -603,7 +790,7 @@ function parseInboundAttachmentCandidate(params: {
   const properties = asRecord(record.properties);
 
   const nestedCandidates: InboundAttachment[] = [];
-  for (const key of ["attachment", "attachments", "file", "files", "image", "images", "media", "medias"]) {
+  for (const key of ["attachment", "attachments", "file", "files", "image", "images", "media", "medias", "audio", "voice"]) {
     if (!hasOwn(record, key)) continue;
     const nested: Array<{ source: string; value: unknown }> = [];
     collectInboundAttachmentCandidates(record[key], `${source}.${key}`, nested, 1);
@@ -704,6 +891,37 @@ function parseInboundAttachmentCandidate(params: {
     parseOptionalSize(properties.file_size) ??
     parseOptionalSize(properties.fileSize) ??
     parseOptionalSize(properties.bytes);
+
+  // Check for audio first
+  const looksLikeAudio =
+    isAllowedInboundAudioMimeType(mimeType) ||
+    isAudioTypeKeyword(record.type) ||
+    isAudioTypeKeyword(record.message_type) ||
+    isAudioTypeKeyword(record.kind) ||
+    isAudioTypeKeyword(record.content_type) ||
+    isAudioTypeKeyword(properties.type) ||
+    isAudioTypeKeyword(properties.message_type) ||
+    isAudioTypeKeyword(properties.kind) ||
+    isAudioTypeKeyword(properties.content_type) ||
+    isLikelyAudioReference(url) ||
+    isLikelyAudioReference(fileName);
+
+  if (looksLikeAudio) {
+    return [
+      {
+        kind: "audio",
+        messageId,
+        source,
+        attachmentId: attachmentId || undefined,
+        url: url || undefined,
+        fileName: fileName || undefined,
+        mimeType: mimeType || undefined,
+        sizeBytes,
+      },
+    ];
+  }
+
+  // Then check for image
   const looksLikeImage =
     isAllowedInboundImageMimeType(mimeType) ||
     isImageTypeKeyword(record.type) ||
@@ -1170,13 +1388,67 @@ function inferInboundAttachmentFileName(attachment: InboundAttachment, contentTy
   const fallbackExt =
     extractExtensionFromPathLike(attachment.fileName || "") ||
     extractExtensionFromPathLike(attachment.url || "") ||
-    inferExtensionFromMimeType(contentType || attachment.mimeType || "") ||
-    ".bin";
-  const baseName = sanitizeFileName(attachment.fileName || path.basename(attachment.url || "") || "attachment");
+    (attachment.kind === "audio"
+      ? inferAudioExtensionFromMimeType(contentType || attachment.mimeType || "")
+      : inferExtensionFromMimeType(contentType || attachment.mimeType || "")) ||
+    (attachment.kind === "audio" ? ".ogg" : ".bin");
+  const baseName = sanitizeFileName(attachment.fileName || path.basename(attachment.url || "") || (attachment.kind === "audio" ? "audio" : "attachment"));
   const parsed = path.parse(baseName);
-  const ext = isImageExtension(parsed.ext || fallbackExt) ? parsed.ext || fallbackExt : fallbackExt;
-  const name = sanitizePathSegment(parsed.name || "attachment", "attachment");
+  const ext = attachment.kind === "audio"
+    ? (isAudioExtension(parsed.ext || fallbackExt) ? parsed.ext || fallbackExt : fallbackExt)
+    : (isImageExtension(parsed.ext || fallbackExt) ? parsed.ext || fallbackExt : fallbackExt);
+  const name = sanitizePathSegment(parsed.name || (attachment.kind === "audio" ? "audio" : "attachment"), attachment.kind === "audio" ? "audio" : "attachment");
   return `${name}${ext}`;
+}
+
+// ASR (Automatic Speech Recognition) transcription using Sherpa-ONNX (local Python)
+async function transcribeAudioFile(params: {
+  audioPath: string;
+  logger?: {
+    info?: (message: string) => void;
+    warn?: (message: string) => void;
+    error?: (message: string) => void;
+  };
+}): Promise<{ text: string; error?: string }> {
+  const { audioPath, logger } = params;
+
+  // Use Python Sherpa-ONNX script
+  const scriptPath = path.join(os.homedir(), ".openclaw", "workspace", "scripts", "sherpa_asr.py");
+
+  try {
+    const { execFile } = await import("node:child_process");
+    
+    const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      execFile("python3", [scriptPath, audioPath], { timeout: 60000 }, (error, stdout, stderr) => {
+        if (error) {
+          reject(new Error(`${error.message}: ${stderr}`));
+        } else {
+          resolve({ stdout, stderr });
+        }
+      });
+    });
+
+    const transcription = normalizeString(result.stdout);
+    
+    if (transcription.startsWith("ERROR:") || !transcription) {
+      return { text: "", error: transcription || "Empty transcription" };
+    }
+
+    logger?.info?.(`[vocechat] Sherpa-ONNX transcription: "${transcription}"`);
+    return { text: transcription };
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    logger?.warn?.(`[vocechat] Sherpa-ONNX failed: ${detail}`);
+    return { text: "", error: detail };
+  }
+}
+
+// Voice learning corrections based on user patterns
+// Only correct ASR misrecognitions, don't guess user intent
+// DISABLED per user request - return original text
+function applyVoiceLearningCorrections(text: string, logger?: { info?: (msg: string) => void; warn?: (msg: string) => void }): string {
+  // User requested no automatic corrections
+  return text;
 }
 
 function buildInboundAttachmentSignature(attachments: InboundAttachment[]): string {
@@ -1284,11 +1556,16 @@ async function hydrateInboundAttachments(params: {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), account.timeoutMs);
     try {
+      // Use appropriate accept header based on attachment kind
+      const acceptHeader = attachment.kind === "audio"
+        ? "audio/*, application/octet-stream;q=0.8, */*;q=0.5"
+        : "image/*, application/octet-stream;q=0.8, */*;q=0.5";
+
       const response = await requestInboundBinaryResource({
         url,
         headers: {
           "x-api-key": account.apiKey,
-          accept: "image/*, application/octet-stream;q=0.8, */*;q=0.5",
+          accept: acceptHeader,
         },
         signal: controller.signal,
         maxBytes: DEFAULT_INBOUND_MEDIA_MAX_BYTES,
@@ -1299,6 +1576,43 @@ async function hydrateInboundAttachments(params: {
 
       const resolvedMimeType = normalizeMimeType(response.contentType || attachment.mimeType);
       const resolvedFileName = inferInboundAttachmentFileName(attachment, resolvedMimeType);
+
+      // Handle audio attachments
+      if (attachment.kind === "audio") {
+        const resolvedExtension = extractExtensionFromPathLike(resolvedFileName) || inferAudioExtensionFromMimeType(resolvedMimeType) || ".ogg";
+        const inferredMimeType = resolvedMimeType || inferAudioMimeTypeFromExtension(resolvedExtension) || "audio/ogg";
+
+        const targetPath = path.join(messageDir, `${String(index + 1).padStart(2, "0")}-${randomUUID()}${resolvedExtension}`);
+        await fs.writeFile(targetPath, response.body);
+
+        // Transcribe audio
+        const transcriptionResult = await transcribeAudioFile({
+          audioPath: targetPath,
+          logger,
+        });
+
+        const hydratedAttachment: InboundAttachment = {
+          ...attachment,
+          kind: "audio",
+          fileName: resolvedFileName,
+          mimeType: inferredMimeType,
+          sizeBytes: response.body.length,
+          localFile: targetPath,
+          downloadError: undefined,
+          transcription: transcriptionResult.text || undefined,
+          transcriptionError: transcriptionResult.error || undefined,
+        };
+        hydratedAttachments.push(hydratedAttachment);
+        manifestAttachments.push({
+          ...hydratedAttachment,
+        });
+        logger?.info?.(
+          `[vocechat] inbound audio stored account=${account.accountId} mid=${event.messageId} index=${index} path=${targetPath} size=${response.body.length} mime=${clipAuditSegment(inferredMimeType)} transcription="${clipAuditSegment(transcriptionResult.text || "")}"`,
+        );
+        continue;
+      }
+
+      // Handle image attachments
       const resolvedExtension = extractExtensionFromPathLike(resolvedFileName) || inferExtensionFromMimeType(resolvedMimeType);
       const inferredMimeType = resolvedMimeType || inferMimeTypeFromExtension(resolvedExtension) || "";
       if (!isAllowedInboundImageMimeType(inferredMimeType) && !isImageExtension(resolvedExtension)) {
@@ -1356,36 +1670,64 @@ function buildInboundAgentBody(event: InboundEvent): string {
   const text = normalizeInboundText(event.text);
   if (event.attachments.length === 0) return text;
 
-  const localAttachments = event.attachments.filter((attachment) => attachment.localFile);
-  const failedAttachments = event.attachments.filter((attachment) => !attachment.localFile);
+  const audioAttachments = event.attachments.filter((a) => a.kind === "audio");
+  const imageAttachments = event.attachments.filter((a) => a.kind === "image");
+  const localAudio = audioAttachments.filter((a) => a.localFile);
+  const localImages = imageAttachments.filter((a) => a.localFile);
+  const failedAudio = audioAttachments.filter((a) => !a.localFile);
+  const failedImages = imageAttachments.filter((a) => !a.localFile);
+
   const lines: string[] = [];
 
-  if (localAttachments.length > 0) {
-    lines.push(
-      localAttachments.length === 1 ? "用户发送了一张图片。" : `用户发送了 ${localAttachments.length} 张图片。`,
-    );
-  } else {
-    lines.push(
-      failedAttachments.length === 1 ? "用户发送了一张图片，但插件未能落地文件。" : `用户发送了 ${failedAttachments.length} 张图片，但插件未能落地文件。`,
-    );
+  // Handle audio attachments
+  if (localAudio.length > 0) {
+    lines.push(localAudio.length === 1 ? "用户发送了一条语音消息。" : `用户发送了 ${localAudio.length} 条语音消息。`);
+    for (const audio of localAudio) {
+      if (audio.transcription) {
+        lines.push(`语音转写：${audio.transcription}`);
+      } else if (audio.transcriptionError) {
+        lines.push(`语音转写失败：${audio.transcriptionError}`);
+      }
+    }
+  }
+  if (failedAudio.length > 0) {
+    lines.push(failedAudio.length === 1 ? "用户发送了一条语音消息，但下载失败。" : `用户发送了 ${failedAudio.length} 条语音消息，但下载失败。`);
+    for (const audio of failedAudio) {
+      if (audio.url) lines.push(`资源 URL：${audio.url}`);
+      lines.push(`失败原因：${audio.downloadError || "unknown_error"}`);
+    }
+  }
+
+  // Handle image attachments
+  if (localImages.length > 0) {
+    lines.push(localImages.length === 1 ? "用户发送了一张图片。" : `用户发送了 ${localImages.length} 张图片。`);
+  }
+  if (failedImages.length > 0 && localImages.length === 0) {
+    lines.push(failedImages.length === 1 ? "用户发送了一张图片，但插件未能落地文件。" : `用户发送了 ${failedImages.length} 张图片，但插件未能落地文件。`);
   }
 
   if (text) lines.push(`用户问题：${text}`);
 
-  for (const attachment of localAttachments) {
+  // Add local file details
+  for (const attachment of [...localImages, ...localAudio]) {
     lines.push(`本地文件：${attachment.localFile}`);
     if (attachment.fileName) lines.push(`原始文件名：${attachment.fileName}`);
     if (attachment.mimeType) lines.push(`MIME：${attachment.mimeType}`);
   }
 
-  for (const attachment of failedAttachments) {
-    lines.push("图片下载失败。");
+  // Add failed attachment details
+  for (const attachment of [...failedImages, ...failedAudio]) {
+    lines.push(attachment.kind === "audio" ? "语音下载失败。" : "图片下载失败。");
     if (attachment.url) lines.push(`资源 URL：${attachment.url}`);
     lines.push(`messageId：${attachment.messageId}`);
     lines.push(`失败原因：${attachment.downloadError || "unknown_error"}`);
   }
 
-  lines.push("如有需要请直接识别图片内容并结合用户问题回复。");
+  // Add hint for images
+  if (localImages.length > 0) {
+    lines.push("如有需要请直接识别图片内容并结合用户问题回复。");
+  }
+
   return lines.join("\n");
 }
 
@@ -2447,6 +2789,45 @@ async function processInboundEvent(params: {
     `[vocechat] inbound media ready account=${account.accountId} mid=${event.messageId} localFiles=${event.localFiles.length} attachmentCount=${event.attachments.length}`,
   );
 
+  // Content-based deduplication for voice messages
+  // VoceChat may send same voice message with different messageIds
+  const audioAttachments = event.attachments.filter((a) => a.kind === "audio");
+  if (audioAttachments.length > 0) {
+    const voiceSignature = [
+      event.fromUid,
+      ...audioAttachments.map((a) => [
+        a.url?.split("/").pop()?.split("?")[0] || "",
+        a.sizeBytes || 0,
+        a.transcription || "",
+      ].join(":")),
+    ].join("|");
+
+    cleanupRecentMessageCache(recentVoiceSignatures);
+    const lastSeen = recentVoiceSignatures.get(voiceSignature);
+    if (lastSeen && nowMs() - lastSeen < 30000) {
+      logger?.info?.(
+        `[vocechat] skip duplicate voice content account=${account.accountId} mid=${event.messageId} signature=${voiceSignature.slice(0, 50)}`,
+      );
+      return;
+    }
+    recentVoiceSignatures.set(voiceSignature, nowMs());
+  }
+
+  // requireMention check: skip group messages that don't mention the bot
+  if (event.chatType === "group") {
+    const groupId = event.groupId ?? event.conversationId;
+    const requireMention = resolveVoceChatGroupRequireMention(cfg, account.accountId, groupId);
+    if (requireMention) {
+      const mentionPatterns = getMentionPatternsFromConfig(cfg);
+      if (!matchesMentionPattern(event.originalText, mentionPatterns)) {
+        logger?.info?.(
+          `[vocechat] inbound skip: group message without mention account=${account.accountId} mid=${event.messageId} group=${groupId} text=${clipAuditSegment(event.originalText, 80)} patterns=${mentionPatterns.join("|") || "-"}`,
+        );
+        return;
+      }
+    }
+  }
+
   const route = runtime.channel.routing.resolveAgentRoute({
     cfg,
     channel: CHANNEL_ID,
@@ -2770,6 +3151,16 @@ const voceChatChannel: ChannelPlugin<ResolvedAccount> = {
               items: { type: "string" },
             },
             panelStateFile: { type: "string" },
+          },
+        },
+        groups: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              requireMention: { type: "boolean" },
+            },
           },
         },
         accounts: {
